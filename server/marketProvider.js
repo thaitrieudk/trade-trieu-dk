@@ -73,8 +73,65 @@ async function fetchPolygonPrevBar(symbol, apiKey) {
   return data.results?.[0] || null;
 }
 
+async function fetchPolygonDailyBars(symbol, apiKey) {
+  const to = new Date();
+  const from = new Date(to);
+  from.setUTCDate(from.getUTCDate() - 60);
+
+  const url = new URL(`/v2/aggs/ticker/${symbol}/range/1/day/${formatDate(from)}/${formatDate(to)}`, POLYGON_BASE_URL);
+  url.searchParams.set("adjusted", "true");
+  url.searchParams.set("sort", "asc");
+  url.searchParams.set("limit", "120");
+  url.searchParams.set("apiKey", apiKey);
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Polygon daily bars failed for ${symbol}: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.results || [];
+}
+
 function positiveNumber(value) {
   return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function finiteNumber(value) {
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function averagePositiveNumbers(values) {
+  const positiveValues = values.filter((value) => Number.isFinite(value) && value > 0);
+  if (!positiveValues.length) return undefined;
+  return positiveValues.reduce((sum, value) => sum + value, 0) / positiveValues.length;
+}
+
+function buildDailyContext(bars) {
+  if (!bars.length) {
+    return { latestBar: null, previousClose: undefined, averageVolume: undefined };
+  }
+
+  const latestBar = bars.at(-1);
+  const priorBars = bars.slice(0, -1);
+
+  return {
+    latestBar,
+    previousClose: positiveNumber(priorBars.at(-1)?.c),
+    averageVolume: averagePositiveNumbers(priorBars.slice(-20).map((bar) => bar.v)),
+  };
+}
+
+async function fetchPolygonFallbackContext(symbol, apiKey) {
+  const bars = await fetchPolygonDailyBars(symbol, apiKey);
+  const context = buildDailyContext(bars);
+
+  if (context.latestBar) return context;
+
+  return {
+    ...context,
+    latestBar: await fetchPolygonPrevBar(symbol, apiKey),
+  };
 }
 
 function buildEmptyTicker(symbol) {
@@ -99,19 +156,22 @@ function buildEmptyTicker(symbol) {
   };
 }
 
-function mergePolygonSnapshot(symbol, snapshot, prevBar = null, details = null) {
+export function mergePolygonSnapshot(symbol, snapshot, prevBar = null, details = null, dailyContext = null) {
   const fallback = buildEmptyTicker(symbol);
 
   if (!snapshot) return fallback;
 
   const snapshotPrice = positiveNumber(snapshot.lastTrade?.p) ?? positiveNumber(snapshot.day?.c);
   const price = snapshotPrice ?? positiveNumber(prevBar?.c) ?? fallback.price;
-  const gap = snapshotPrice ? snapshot.todaysChangePerc ?? fallback.gap : 0;
   const day = snapshot.day || {};
   const minute = snapshot.min || {};
   const prevDay = snapshot.prevDay || {};
   const sessionVolume = positiveNumber(day.v) ?? positiveNumber(prevBar?.v);
-  const relVol = prevDay.v && day.v ? Math.max(0.1, day.v / prevDay.v) : fallback.relVol;
+  const previousClose = positiveNumber(dailyContext?.previousClose) ?? positiveNumber(prevDay.c);
+  const derivedGap = previousClose && price ? ((price - previousClose) / previousClose) * 100 : undefined;
+  const gap = finiteNumber(snapshot.todaysChangePerc) ?? derivedGap ?? fallback.gap;
+  const comparisonVolume = positiveNumber(dailyContext?.averageVolume) ?? positiveNumber(prevDay.v);
+  const relVol = comparisonVolume && sessionVolume ? Math.max(0.1, sessionVolume / comparisonVolume) : fallback.relVol;
   const ticker = {
     ...fallback,
     symbol,
@@ -147,8 +207,11 @@ export async function getMarketTicker(symbol) {
     try {
       const snapshot = await fetchPolygonSnapshot(normalized, apiKey);
       const snapshotPrice = positiveNumber(snapshot?.lastTrade?.p) ?? positiveNumber(snapshot?.day?.c);
-      const [prevBar, details] = await Promise.all([snapshotPrice ? Promise.resolve(null) : fetchPolygonPrevBar(normalized, apiKey), fetchTickerDetails(normalized, apiKey)]);
-      return { ticker: mergePolygonSnapshot(normalized, snapshot, prevBar, details), source: "polygon", live: true };
+      const [dailyContext, details] = await Promise.all([
+        snapshotPrice ? Promise.resolve({ latestBar: null, previousClose: undefined, averageVolume: undefined }) : fetchPolygonFallbackContext(normalized, apiKey),
+        fetchTickerDetails(normalized, apiKey),
+      ]);
+      return { ticker: mergePolygonSnapshot(normalized, snapshot, dailyContext.latestBar, details, dailyContext), source: "polygon", live: true };
     } catch (error) {
       throw error;
     }
