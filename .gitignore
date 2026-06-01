@@ -8,5 +8,3 @@ dist
 npm-debug.log*
 vite-dev*.log
 api-dev*.log
-
-.vercel
