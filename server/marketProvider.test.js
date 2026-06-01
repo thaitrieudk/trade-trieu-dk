@@ -60,3 +60,46 @@ test("mergePolygonSnapshot compares fallback volume to recent average volume whe
   assert.equal(ticker.relVol, 3);
   assert.ok(ticker.score > 20);
 });
+
+test("mergePolygonSnapshot uses latest intraday aggregate before previous session price", () => {
+  const ticker = mergePolygonSnapshot(
+    "NVDA",
+    {
+      ticker: "NVDA",
+      prevDay: {
+        c: 206.88,
+        v: 160_000_000,
+      },
+    },
+    {
+      c: 211.14,
+      h: 217.86,
+      l: 211.13,
+      v: 289_400_000,
+      vw: 215.58,
+    },
+    { name: "Nvidia Corp" },
+    {
+      previousClose: 206.88,
+      averageVolume: 160_000_000,
+      latestIntradayBar: {
+        c: 215.49,
+        h: 215.7,
+        l: 214.8,
+        v: 85_135,
+        vw: 215.42,
+      },
+      intradayHigh: 216.12,
+      intradayLow: 213.8,
+      intradayVolume: 2_750_000,
+    },
+  );
+
+  assert.equal(ticker.price, 215.49);
+  assert.equal(ticker.gap, 4.2);
+  assert.equal(ticker.vwap, 215.42);
+  assert.equal(ticker.pmHigh, 216.12);
+  assert.equal(ticker.pmLow, 213.8);
+  assert.equal(ticker.volumeM, 2.8);
+  assert.equal(ticker.sources[0][0], "Polygon intraday aggregate");
+});

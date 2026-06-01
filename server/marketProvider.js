@@ -93,6 +93,26 @@ async function fetchPolygonDailyBars(symbol, apiKey) {
   return data.results || [];
 }
 
+async function fetchPolygonIntradayBars(symbol, apiKey) {
+  const to = new Date();
+  const from = new Date(to);
+  from.setUTCDate(from.getUTCDate() - 1);
+
+  const url = new URL(`/v2/aggs/ticker/${symbol}/range/1/minute/${formatDate(from)}/${formatDate(to)}`, POLYGON_BASE_URL);
+  url.searchParams.set("adjusted", "true");
+  url.searchParams.set("sort", "asc");
+  url.searchParams.set("limit", "5000");
+  url.searchParams.set("apiKey", apiKey);
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Polygon intraday bars failed for ${symbol}: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.results || [];
+}
+
 function positiveNumber(value) {
   return Number.isFinite(value) && value > 0 ? value : undefined;
 }
@@ -122,9 +142,30 @@ function buildDailyContext(bars) {
   };
 }
 
+function buildIntradayContext(bars) {
+  if (!bars.length) {
+    return {
+      latestIntradayBar: null,
+      intradayHigh: undefined,
+      intradayLow: undefined,
+      intradayVolume: undefined,
+    };
+  }
+
+  return {
+    latestIntradayBar: bars.at(-1),
+    intradayHigh: Math.max(...bars.map((bar) => bar.h).filter((value) => Number.isFinite(value))),
+    intradayLow: Math.min(...bars.map((bar) => bar.l).filter((value) => Number.isFinite(value))),
+    intradayVolume: bars.reduce((sum, bar) => sum + (Number.isFinite(bar.v) ? bar.v : 0), 0),
+  };
+}
+
 async function fetchPolygonFallbackContext(symbol, apiKey) {
-  const bars = await fetchPolygonDailyBars(symbol, apiKey);
-  const context = buildDailyContext(bars);
+  const [dailyBars, intradayBars] = await Promise.all([fetchPolygonDailyBars(symbol, apiKey), fetchPolygonIntradayBars(symbol, apiKey)]);
+  const context = {
+    ...buildDailyContext(dailyBars),
+    ...buildIntradayContext(intradayBars),
+  };
 
   if (context.latestBar) return context;
 
@@ -162,16 +203,26 @@ export function mergePolygonSnapshot(symbol, snapshot, prevBar = null, details =
   if (!snapshot) return fallback;
 
   const snapshotPrice = positiveNumber(snapshot.lastTrade?.p) ?? positiveNumber(snapshot.day?.c);
-  const price = snapshotPrice ?? positiveNumber(prevBar?.c) ?? fallback.price;
+  const latestIntradayBar = dailyContext?.latestIntradayBar || null;
+  const price = snapshotPrice ?? positiveNumber(latestIntradayBar?.c) ?? positiveNumber(prevBar?.c) ?? fallback.price;
   const day = snapshot.day || {};
   const minute = snapshot.min || {};
   const prevDay = snapshot.prevDay || {};
-  const sessionVolume = positiveNumber(day.v) ?? positiveNumber(prevBar?.v);
+  const sessionVolume = positiveNumber(day.v) ?? positiveNumber(dailyContext?.intradayVolume) ?? positiveNumber(prevBar?.v);
   const previousClose = positiveNumber(dailyContext?.previousClose) ?? positiveNumber(prevDay.c);
   const derivedGap = previousClose && price ? ((price - previousClose) / previousClose) * 100 : undefined;
   const gap = finiteNumber(snapshot.todaysChangePerc) ?? derivedGap ?? fallback.gap;
   const comparisonVolume = positiveNumber(dailyContext?.averageVolume) ?? positiveNumber(prevDay.v);
   const relVol = comparisonVolume && sessionVolume ? Math.max(0.1, sessionVolume / comparisonVolume) : fallback.relVol;
+  const fallbackSource = latestIntradayBar
+    ? [
+        "Polygon intraday aggregate",
+        "Snapshot price is empty; using the latest available 1-minute aggregate for price and session metrics.",
+      ]
+    : [
+        "Polygon previous session",
+        "Snapshot is empty outside active market reporting; using the previous adjusted daily bar.",
+      ];
   const ticker = {
     ...fallback,
     symbol,
@@ -179,17 +230,15 @@ export function mergePolygonSnapshot(symbol, snapshot, prevBar = null, details =
     price: round(price),
     gap: round(gap, 1),
     relVol: round(relVol, 1),
-    atr: round((positiveNumber(day.h) ?? positiveNumber(prevBar?.h) ?? 0) - (positiveNumber(day.l) ?? positiveNumber(prevBar?.l) ?? 0)),
-    pmHigh: round(positiveNumber(day.h) ?? positiveNumber(prevBar?.h) ?? fallback.pmHigh),
-    pmLow: round(positiveNumber(day.l) ?? positiveNumber(prevBar?.l) ?? fallback.pmLow),
-    vwap: round(positiveNumber(minute.vw) ?? positiveNumber(day.vw) ?? positiveNumber(prevBar?.vw) ?? fallback.vwap),
+    atr: round((positiveNumber(day.h) ?? positiveNumber(dailyContext?.intradayHigh) ?? positiveNumber(prevBar?.h) ?? 0) - (positiveNumber(day.l) ?? positiveNumber(dailyContext?.intradayLow) ?? positiveNumber(prevBar?.l) ?? 0)),
+    pmHigh: round(positiveNumber(day.h) ?? positiveNumber(dailyContext?.intradayHigh) ?? positiveNumber(prevBar?.h) ?? fallback.pmHigh),
+    pmLow: round(positiveNumber(day.l) ?? positiveNumber(dailyContext?.intradayLow) ?? positiveNumber(prevBar?.l) ?? fallback.pmLow),
+    vwap: round(positiveNumber(minute.vw) ?? positiveNumber(latestIntradayBar?.vw) ?? positiveNumber(day.vw) ?? positiveNumber(prevBar?.vw) ?? fallback.vwap),
     volumeM: round((sessionVolume ?? fallback.volumeM * 1_000_000) / 1_000_000, 1),
     sources: [
       [
-        prevBar && !snapshotPrice ? "Polygon previous session" : "Polygon snapshot",
-        prevBar && !snapshotPrice
-          ? "Snapshot is empty outside active market reporting; using the previous adjusted daily bar."
-          : "Price, change, session range, VWAP, and volume loaded from Polygon.",
+        !snapshotPrice ? fallbackSource[0] : "Polygon snapshot",
+        !snapshotPrice ? fallbackSource[1] : "Price, change, session range, VWAP, and volume loaded from Polygon.",
       ],
       ...(fallback.sources || []),
     ],
