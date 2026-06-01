@@ -1,0 +1,12 @@
+node_modules
+dist
+.env
+.env.local
+.vercel
+.superpowers
+.DS_Store
+npm-debug.log*
+vite-dev*.log
+api-dev*.log
+
+.vercel
