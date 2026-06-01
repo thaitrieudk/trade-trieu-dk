@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { resolveTickerForSymbol, shouldRequestAnalysis } from "./tradingState.js";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || (import.meta.env.PROD ? "" : "http://127.0.0.1:8787");
 
@@ -101,6 +102,14 @@ function upsertTicker(universe, ticker) {
   if (!ticker?.symbol) return universe;
   const exists = universe.some((item) => item.symbol === ticker.symbol);
   return exists ? universe.map((item) => (item.symbol === ticker.symbol ? ticker : item)) : [ticker, ...universe];
+}
+
+function stampTicker(ticker, timestamp = "") {
+  if (!ticker?.symbol) return ticker;
+  return {
+    ...ticker,
+    lastUpdatedAt: timestamp || new Date().toISOString(),
+  };
 }
 
 function mergeTickerLists(primary = [], supplemental = []) {
@@ -647,6 +656,7 @@ function CopilotPanel({
   const summaryText = shortText(activeAnalysis?.summary, 165);
   const thesisText = shortText(activeAnalysis?.thesis, 260);
   const riskText = shortText((activeAnalysis?.risks || []).join(" "), 260);
+  const hasOpenAiAnalysis = activeAnalysis?.symbol === ticker.symbol && activeAnalysis?.source === "openai";
 
   return (
     <section className="panel copilot-panel">
@@ -658,7 +668,7 @@ function CopilotPanel({
         <div className="analysis-actions">
           <span className={`analysis-timestamp ${analysisCacheStatus || "miss"}`}>{analysisTimeCopy}</span>
           <button className="panel-action analyze-button" type="button" onClick={() => onAnalyze(ticker.symbol)} disabled={analysisLoading || analysisCacheLoading}>
-            {analysisLoading ? "Analyzing..." : "Analyze"}
+            {analysisLoading ? "Analyzing..." : hasOpenAiAnalysis ? "Re-analyze" : "Analyze"}
           </button>
         </div>
       </div>
@@ -870,9 +880,9 @@ export default function App() {
     const filtered = marketUniverse.filter((ticker) => matchesScanner(ticker, filters));
     return mergeTickerLists(filtered, savedWorkspaceTickers);
   }, [filters, marketUniverse, savedWorkspaceTickers]);
-  const activeTicker = getTicker(activeSymbol, marketUniverse) || (lookupTicker?.symbol === activeSymbol ? lookupTicker : null) || scannerCandidates[0] || marketUniverse[0] || initialTicker;
+  const activeTicker = resolveTickerForSymbol(activeSymbol, { universe: marketUniverse, lookupTicker }) || scannerCandidates[0] || marketUniverse[0] || initialTicker;
   const searchSymbol = searchValue.trim().toUpperCase();
-  const searchResult = (lookupTicker?.symbol === searchSymbol ? lookupTicker : null) || marketUniverse.find((ticker) => ticker.symbol === searchSymbol);
+  const searchResult = resolveTickerForSymbol(searchSymbol, { universe: marketUniverse, lookupTicker });
   const filterSummary = formatFilterSummary(filters);
   const activeInFocus = focusSymbols.includes(activeTicker.symbol);
   const activeInScanner = scannerCandidates.some((ticker) => ticker.symbol === activeTicker.symbol);
@@ -902,6 +912,17 @@ export default function App() {
     }).catch(() => {
       showToast(`${ticker.symbol} is available in this session, but Supabase did not save the workspace change.`);
     });
+  }
+
+  async function loadLatestTicker(symbol) {
+    const normalized = String(symbol || "").trim().toUpperCase();
+    if (!normalized) return null;
+
+    const data = await fetchApi(`/api/market/ticker/${encodeURIComponent(normalized)}`);
+    const latestTicker = stampTicker(data.ticker, data.generatedAt);
+    setLookupTicker(latestTicker);
+    setMarketUniverse((current) => upsertTicker(current, latestTicker));
+    return latestTicker;
   }
 
   async function refreshMarketData(message = true) {
@@ -990,7 +1011,9 @@ export default function App() {
       try {
         const data = await fetchApi(`/api/market/ticker/${encodeURIComponent(symbol)}`);
         if (cancelled) return;
-        setLookupTicker(data.ticker);
+        const latestTicker = stampTicker(data.ticker, data.generatedAt);
+        setLookupTicker(latestTicker);
+        setMarketUniverse((current) => upsertTicker(current, latestTicker));
       } catch {
         if (cancelled) return;
         setLookupTicker(null);
@@ -1030,7 +1053,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeTicker.symbol]);
+  }, [activeTicker.symbol, activeTicker.lastUpdatedAt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1077,9 +1100,10 @@ export default function App() {
   }, [activeTicker.symbol]);
 
   async function requestAnalysis(symbol = activeTicker.symbol) {
-    const ticker = symbol === activeTicker.symbol ? activeTicker : getTicker(symbol, marketUniverse);
+    const ticker = symbol === activeTicker.symbol ? activeTicker : resolveTickerForSymbol(symbol, { universe: marketUniverse, lookupTicker });
     if (!ticker || analysisLoading || analysisInFlightRef.current) return;
-    if (analysis?.symbol === ticker.symbol && analysis.source === "openai") {
+    const force = analysis?.symbol === ticker.symbol && analysis.source === "openai";
+    if (!shouldRequestAnalysis({ analysis, ticker, force })) {
       setAnalysisRequested(true);
       showToast(`${ticker.symbol} analysis already loaded. No new tokens used.`);
       return;
@@ -1097,6 +1121,7 @@ export default function App() {
           ticker,
           scannerCandidates,
           focusSymbols,
+          force,
         }),
       });
       const nextAnalysis = data.analysis || buildLocalAnalysis(ticker);
@@ -1139,27 +1164,56 @@ export default function App() {
     setDraftFilters(defaultFilters);
   }
 
-  function toggleFocus(symbol) {
-    const ticker = getTicker(symbol, marketUniverse) || (lookupTicker?.symbol === symbol ? lookupTicker : null);
+  async function selectTicker(symbol) {
+    const existing = resolveTickerForSymbol(symbol, { universe: marketUniverse, lookupTicker });
+    const normalized = String(symbol || existing?.symbol || "").trim().toUpperCase();
+    if (!normalized) return;
+
+    setActiveSymbol(normalized);
+    try {
+      await loadLatestTicker(normalized);
+    } catch {
+      showToast(`${normalized} opened with saved data. Live refresh failed.`);
+    }
+  }
+
+  async function toggleFocus(symbol) {
+    const existing = resolveTickerForSymbol(symbol, { universe: marketUniverse, lookupTicker });
+    if (existing) setActiveSymbol(existing.symbol);
+
+    let ticker = existing;
+    try {
+      ticker = (await loadLatestTicker(symbol)) || existing;
+    } catch {
+      if (existing) showToast(`${existing.symbol} focus changed with saved data. Live refresh failed.`);
+    }
     if (!ticker) return;
-    const inFocus = focusSymbols.includes(symbol);
+    const inFocus = focusSymbols.includes(ticker.symbol);
     const nextInFocus = !inFocus;
     setMarketUniverse((current) => upsertTicker(current, ticker));
     rememberWorkspaceTicker(ticker);
-    setFocusSymbols((current) => (current.includes(symbol) ? current.filter((item) => item !== symbol) : uniqueSymbols([symbol, ...current])));
-    setActiveSymbol(symbol);
+    setFocusSymbols((current) => (current.includes(ticker.symbol) ? current.filter((item) => item !== ticker.symbol) : uniqueSymbols([ticker.symbol, ...current])));
+    setActiveSymbol(ticker.symbol);
     saveWorkspaceTicker(ticker, { inFocus: nextInFocus, savedToScanner: true });
-    showToast(`${symbol} ${inFocus ? "removed from Trading Focus and kept in scanner workspace" : "added to Trading Focus and saved"}.`);
+    showToast(`${ticker.symbol} ${inFocus ? "removed from Trading Focus and kept in scanner workspace" : "added to Trading Focus and saved"}.`);
   }
 
-  function openTicker(symbol) {
-    const ticker = getTicker(symbol, marketUniverse) || (lookupTicker?.symbol === symbol ? lookupTicker : null);
+  async function openTicker(symbol) {
+    const existing = resolveTickerForSymbol(symbol, { universe: marketUniverse, lookupTicker });
+    if (existing) setActiveSymbol(existing.symbol);
+
+    let ticker = existing;
+    try {
+      ticker = (await loadLatestTicker(symbol)) || existing;
+    } catch {
+      if (existing) showToast(`${existing.symbol} opened with saved data. Live refresh failed.`);
+    }
     if (!ticker) return;
     setMarketUniverse((current) => upsertTicker(current, ticker));
     rememberWorkspaceTicker(ticker);
-    setActiveSymbol(symbol);
-    saveWorkspaceTicker(ticker, { inFocus: focusSymbols.includes(symbol), savedToScanner: true });
-    showToast(`${symbol} opened and saved to scanner workspace. Add focus only if you want it on the watchlist.`);
+    setActiveSymbol(ticker.symbol);
+    saveWorkspaceTicker(ticker, { inFocus: focusSymbols.includes(ticker.symbol), savedToScanner: true });
+    showToast(`${ticker.symbol} refreshed and saved to scanner workspace. Add focus only if you want it on the watchlist.`);
   }
 
   function moveFocus(direction) {
@@ -1174,7 +1228,7 @@ export default function App() {
           ? 0
           : focusSymbols.length - 1
         : (currentIndex + direction + focusSymbols.length) % focusSymbols.length;
-    setActiveSymbol(focusSymbols[nextIndex]);
+    selectTicker(focusSymbols[nextIndex]);
   }
 
   return (
@@ -1207,7 +1261,7 @@ export default function App() {
         <TradingFocus
           focusSymbols={focusSymbols}
           activeSymbol={activeTicker.symbol}
-          onSelect={setActiveSymbol}
+          onSelect={selectTicker}
           onPrev={() => moveFocus(-1)}
           onNext={() => moveFocus(1)}
           universe={marketUniverse}
@@ -1217,7 +1271,7 @@ export default function App() {
             <ScannerPanel
               candidates={scannerCandidates}
               activeSymbol={activeTicker.symbol}
-              onSelect={setActiveSymbol}
+              onSelect={selectTicker}
               filterSummary={filterSummary}
               onOpenFilters={openFilters}
             />
